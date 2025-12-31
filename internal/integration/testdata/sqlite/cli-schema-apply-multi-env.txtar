@@ -1,0 +1,23 @@
+atlas schema apply --env local --auto-approve
+
+-- atlas.hcl --
+env {
+  for_each = toset([
+    "URL",
+    "URL&name=1",
+  ])
+  name = atlas.env
+  url  = each.value
+  src  = "./schema.hcl"
+}
+-- schema.hcl --
+schema "main" {
+}
+
+table "users" {
+  schema = schema.main
+  column "id" {
+    type = int
+    null = false
+  }
+}

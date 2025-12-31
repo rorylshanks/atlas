@@ -178,3 +178,10 @@ services:
     ports:
       - "26257:26257"
     command: "start-single-node --insecure"
+
+  clickhouse:
+    container_name: atlas-integration-clickhouse
+    platform: linux/amd64
+    image: clickhouse/clickhouse-server:25.12
+    ports:
+      - "9000:9000"

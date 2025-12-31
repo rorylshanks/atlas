@@ -804,6 +804,7 @@ func TestSchema_ApplyEnvs(t *testing.T) {
 }
 
 func TestAtlasSchema_Lint(t *testing.T) {
+	skipIfAtlasMissingCommand(t, []string{"schema"}, "lint")
 	t.Run("with broken config", func(t *testing.T) {
 		c, err := atlasexec.NewClient(".", "atlas")
 		require.NoError(t, err)

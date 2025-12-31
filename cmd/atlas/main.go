@@ -17,6 +17,7 @@ import (
 	"ariga.io/atlas/cmd/atlas/internal/cmdapi/vercheck"
 	"ariga.io/atlas/cmd/atlas/internal/cmdlog"
 	_ "ariga.io/atlas/cmd/atlas/internal/docker"
+	_ "ariga.io/atlas/sql/clickhouse"
 	_ "ariga.io/atlas/sql/mysql"
 	_ "ariga.io/atlas/sql/mysql/mysqlcheck"
 	_ "ariga.io/atlas/sql/postgres"
@@ -25,6 +26,7 @@ import (
 	_ "ariga.io/atlas/sql/sqlite/sqlitecheck"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 	_ "github.com/lib/pq"
 	"github.com/mattn/go-isatty"
 	_ "github.com/mattn/go-sqlite3"

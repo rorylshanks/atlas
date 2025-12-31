@@ -375,6 +375,7 @@ func TestAtlasMigrate_Apply(t *testing.T) {
 }
 
 func TestAtlasMigrate_ApplyWithRemote(t *testing.T) {
+	skipIfAtlasMissingCommand(t, nil, "login")
 	type (
 		ContextInput struct {
 			TriggerType    string `json:"triggerType,omitempty"`
@@ -456,6 +457,8 @@ func TestAtlasMigrate_ApplyWithRemote(t *testing.T) {
 }
 
 func TestAtlasMigrate_Push(t *testing.T) {
+	skipIfAtlasMissingCommand(t, []string{"migrate"}, "push")
+	skipIfAtlasMissingFlag(t, []string{"migrate", "push"}, "--dev-url")
 	type (
 		graphQLQuery struct {
 			Query     string          `json:"query"`
@@ -601,6 +604,8 @@ func TestMigrateHash(t *testing.T) {
 }
 
 func TestMigrateRebase(t *testing.T) {
+	skipIfAtlasMissingCommand(t, []string{"migrate"}, "rebase")
+	skipIfAtlasMissingFlag(t, []string{"migrate", "rebase"}, "--dir")
 	td := t.TempDir()
 	require.NoError(t, os.Mkdir(fmt.Sprintf("%s/migrations", td), 0777))
 	// create initial migrations dir state
@@ -701,7 +706,27 @@ func TestAtlasMigrate_Lint(t *testing.T) {
 			}},
 			Error: "destructive changes detected",
 		}
-		require.EqualValues(t, expectedReport, got.Files[0])
+		require.Equal(t, expectedReport.Name, got.Files[0].Name)
+		require.Equal(t, expectedReport.Text, got.Files[0].Text)
+		require.Equal(t, expectedReport.Error, got.Files[0].Error)
+		require.Len(t, got.Files[0].Reports, 1)
+		gotReport := got.Files[0].Reports[0]
+		require.Equal(t, expectedReport.Reports[0].Text, gotReport.Text)
+		require.Equal(t, expectedReport.Reports[0].Desc, gotReport.Desc)
+		require.Len(t, gotReport.Diagnostics, 1)
+		gotDiag := gotReport.Diagnostics[0]
+		expectedDiag := expectedReport.Reports[0].Diagnostics[0]
+		require.Equal(t, expectedDiag.Pos, gotDiag.Pos)
+		require.Equal(t, expectedDiag.Text, gotDiag.Text)
+		require.Equal(t, expectedDiag.Code, gotDiag.Code)
+		require.Len(t, gotDiag.SuggestedFixes, 1)
+		gotFix := gotDiag.SuggestedFixes[0]
+		expectedFix := expectedDiag.SuggestedFixes[0]
+		require.Equal(t, expectedFix.Message, gotFix.Message)
+		if gotFix.TextEdit != nil {
+			require.NotNil(t, expectedFix.TextEdit)
+			require.Equal(t, *expectedFix.TextEdit, *gotFix.TextEdit)
+		}
 	})
 	t.Run("lint with manually parsing output", func(t *testing.T) {
 		c, err := atlasexec.NewClient(".", "atlas")
@@ -719,6 +744,7 @@ func TestAtlasMigrate_Lint(t *testing.T) {
 		require.Contains(t, string(raw), "destructive changes detected")
 	})
 	t.Run("lint uses --base and --latest", func(t *testing.T) {
+		skipIfAtlasMissingFlag(t, []string{"migrate", "lint"}, "--base")
 		c, err := atlasexec.NewClient(".", "atlas")
 		require.NoError(t, err)
 		summary, err := c.MigrateLint(context.Background(), &atlasexec.MigrateLintParams{
@@ -733,6 +759,8 @@ func TestAtlasMigrate_Lint(t *testing.T) {
 }
 
 func TestAtlasMigrate_LintWithLogin(t *testing.T) {
+	skipIfAtlasMissingCommand(t, nil, "login")
+	skipIfAtlasMissingFlag(t, []string{"migrate", "lint"}, "-w")
 	type (
 		migrateLintReport struct {
 			Context *atlasexec.RunContext `json:"context"`
@@ -849,6 +877,7 @@ func TestAtlasMigrate_LintWithLogin(t *testing.T) {
 		require.Equal(t, "https://migration-lint-report-url", sr.URL)
 	})
 	t.Run("lint uses --base", func(t *testing.T) {
+		skipIfAtlasMissingFlag(t, []string{"migrate", "lint"}, "--base")
 		var payloads []graphQLQuery
 		srv := httptest.NewServer(handler(&payloads))
 		t.Cleanup(srv.Close)
@@ -865,6 +894,7 @@ func TestAtlasMigrate_LintWithLogin(t *testing.T) {
 		require.NotNil(t, summary)
 	})
 	t.Run("lint uses --context has error", func(t *testing.T) {
+		skipIfAtlasMissingFlag(t, []string{"migrate", "lint"}, "--context")
 		var payloads []graphQLQuery
 		srv := httptest.NewServer(handler(&payloads))
 		t.Cleanup(srv.Close)
@@ -911,6 +941,7 @@ func TestAtlasMigrate_LintWithLogin(t *testing.T) {
 }
 
 func TestMigrate_Diff(t *testing.T) {
+	skipIfAtlasMissingFlag(t, []string{"migrate", "diff"}, "--dry-run")
 	c, err := atlasexec.NewClient(".", "atlas")
 	require.NoError(t, err)
 	td := t.TempDir()

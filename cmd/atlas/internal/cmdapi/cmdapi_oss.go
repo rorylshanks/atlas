@@ -12,16 +12,21 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
 
+	"ariga.io/atlas/cmd/atlas/internal/cloudapi"
 	"ariga.io/atlas/cmd/atlas/internal/cmdext"
 	"ariga.io/atlas/cmd/atlas/internal/cmdlog"
 	"ariga.io/atlas/cmd/atlas/internal/cmdstate"
 	cmdmigrate "ariga.io/atlas/cmd/atlas/internal/migrate"
 	"ariga.io/atlas/cmd/atlas/internal/migratelint"
 	"ariga.io/atlas/schemahcl"
+	"ariga.io/atlas/sql/clickhouse"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
 	"ariga.io/atlas/sql/sqlcheck"
@@ -318,8 +323,6 @@ func schemaApplyRunE(cmd *cobra.Command, _ []string, flags *schemaApplyFlags) er
 		return AbortErrorf("%s", unsupportedMessage("schema", "apply --edit"))
 	case flags.planURL != "":
 		return AbortErrorf("%s", unsupportedMessage("schema", "apply --plan"))
-	case len(flags.include) > 0:
-		return AbortErrorf("%s", unsupportedMessage("schema", "apply --include"))
 	case GlobalFlags.SelectedEnv == "":
 		env, err := selectEnv(cmd)
 		if err != nil {
@@ -331,13 +334,18 @@ func schemaApplyRunE(cmd *cobra.Command, _ []string, flags *schemaApplyFlags) er
 		if err != nil {
 			return err
 		}
-		if len(envs) != 1 {
-			return fmt.Errorf("multi-environment %q is not supported", GlobalFlags.SelectedEnv)
+		if len(envs) == 1 {
+			if err := setSchemaEnvFlags(cmd, envs[0]); err != nil {
+				return err
+			}
+			return schemaApplyRun(cmd, *flags, envs[0])
 		}
-		if err := setSchemaEnvFlags(cmd, envs[0]); err != nil {
-			return err
+		if flags.autoApprove || flags.logFormat != "" {
+			return cmdEnvsRun(envs, setSchemaEnvFlags, cmd, func(env *Env) error {
+				return schemaApplyRun(cmd, *flags, env)
+			})
 		}
-		return schemaApplyRun(cmd, *flags, envs[0])
+		return schemaApplyRunMulti(cmd, flags, envs)
 	}
 }
 
@@ -348,6 +356,8 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		dev    *sqlclient.Client
 		format = cmdlog.SchemaPlanTemplate
 	)
+	printEnvPlanHeader(cmd, env, flags.url)
+	cmd.Println("Planning: inspect current state and load desired schema.")
 	if err = flags.check(env); err != nil {
 		return err
 	}
@@ -394,6 +404,10 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 	if err != nil {
 		return err
 	}
+	if len(flags.include) > 0 {
+		diff.changes = filterTableChangesByInclude(diff.changes, flags.include)
+	}
+	diff.changes = orderChangesForApply(client, diff.changes)
 	maySuggestUpgrade(cmd)
 	// Returning at this stage should
 	// not trigger the help message.
@@ -411,7 +425,8 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		if plan, err = client.PlanChanges(ctx, "", changes, planOptions(client)...); err != nil {
 			return err
 		}
-		if err = applyChanges(ctx, client, changes, flags.txMode); err == nil {
+		logApplyStart(cmd, env)
+		if err = applyChangesWithLogging(ctx, client, changes, flags.txMode, nil); err == nil {
 			applied = len(plan.Changes)
 		} else if i, ok := err.(interface{ Applied() int }); ok && i.Applied() < len(plan.Changes) {
 			applied, cause = i.Applied(), &cmdlog.StmtError{Stmt: plan.Changes[i.Applied()].Cmd, Text: err.Error()}
@@ -427,10 +442,188 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		case flags.dryRun:
 			return nil
 		case flags.autoApprove:
-			return applyChanges(ctx, client, changes, flags.txMode)
+			logApplyStart(cmd, env)
+			return applyChangesWithLogging(ctx, client, changes, flags.txMode, func(ch schema.Change) {
+				logTableCreate(cmd, ch)
+			})
 		default:
-			return promptApply(cmd, flags, diff, client, dev)
+			return promptApply(cmd, flags, diff, client, dev, env)
 		}
+	}
+}
+
+type schemaApplyEnvPlan struct {
+	env     *Env
+	flags   schemaApplyFlags
+	changes []schema.Change
+	client  *sqlclient.Client
+}
+
+func schemaApplyRunMulti(cmd *cobra.Command, flags *schemaApplyFlags, envs []*Env) error {
+	var (
+		ctx      = cmd.Context()
+		reset    = resetFromEnv(cmd)
+		hasPlans bool
+		plans    []schemaApplyEnvPlan
+		totalAdd int
+		totalMod int
+		totalDel int
+	)
+	defer reset()
+	for _, env := range envs {
+		printEnvPlanHeader(cmd, env, env.URL)
+		cmd.Println("Planning: inspect current state and load desired schema.")
+		if err := setSchemaEnvFlags(cmd, env); err != nil {
+			return err
+		}
+		envFlags := *flags
+		plan, err := planSchemaApply(ctx, cmd, env, envFlags)
+		if err != nil {
+			return err
+		}
+		if len(plan.changes) > 0 {
+			hasPlans = true
+		}
+		plans = append(plans, plan)
+		reset()
+	}
+	for _, plan := range plans {
+		printEnvPlanHeader(cmd, plan.env, plan.flags.url)
+		adds, mods, drops := countTableChanges(plan.changes)
+		totalAdd += adds
+		totalMod += mods
+		totalDel += drops
+		printTablePlanSummaryWithCounts(cmd, adds, mods, drops)
+		switch {
+		case len(plan.changes) == 0:
+			cmd.Println("No changes.")
+		default:
+			if err := summary(cmd, plan.client, plan.changes, cmdlog.SchemaPlanTemplate); err != nil {
+				return err
+			}
+		}
+		cmd.Println()
+	}
+	printTablePlanSummaryWithCounts(cmd, totalAdd, totalMod, totalDel)
+	cmd.Println()
+	if !hasPlans || flags.dryRun {
+		for i := range plans {
+			if plans[i].client != nil {
+				plans[i].client.Close()
+			}
+		}
+		return nil
+	}
+	if !promptUser(cmd) {
+		for i := range plans {
+			if plans[i].client != nil {
+				plans[i].client.Close()
+			}
+		}
+		return nil
+	}
+	for i := range plans {
+		p := &plans[i]
+		if len(p.changes) == 0 {
+			if p.client != nil {
+				p.client.Close()
+			}
+			continue
+		}
+		logApplyStart(cmd, p.env)
+		if err := applyChangesWithLogging(ctx, p.client, p.changes, p.flags.txMode, func(ch schema.Change) {
+			logTableCreate(cmd, ch)
+		}); err != nil {
+			_ = p.client.Close()
+			return err
+		}
+		_ = p.client.Close()
+	}
+	return nil
+}
+
+func planSchemaApply(ctx context.Context, cmd *cobra.Command, env *Env, flags schemaApplyFlags) (schemaApplyEnvPlan, error) {
+	if err := flags.check(env); err != nil {
+		return schemaApplyEnvPlan{}, err
+	}
+	var (
+		err error
+		dev *sqlclient.Client
+	)
+	if flags.devURL != "" {
+		if dev, err = sqlclient.Open(ctx, flags.devURL); err != nil {
+			return schemaApplyEnvPlan{}, err
+		}
+	}
+	from, err := stateReader(ctx, env, &stateReaderConfig{
+		urls:    []string{flags.url},
+		schemas: flags.schemas,
+		exclude: flags.exclude,
+	})
+	if err != nil {
+		if dev != nil {
+			dev.Close()
+		}
+		return schemaApplyEnvPlan{}, err
+	}
+	client, ok := from.Closer.(*sqlclient.Client)
+	if !ok {
+		if dev != nil {
+			dev.Close()
+		}
+		from.Close()
+		return schemaApplyEnvPlan{}, errors.New("--url must be a database connection")
+	}
+	to, err := stateReader(ctx, env, &stateReaderConfig{
+		urls:    flags.toURLs,
+		dev:     dev,
+		client:  client,
+		schemas: flags.schemas,
+		exclude: flags.exclude,
+		vars:    env.Vars(),
+	})
+	if err != nil {
+		if dev != nil {
+			dev.Close()
+		}
+		from.Close()
+		return schemaApplyEnvPlan{}, err
+	}
+	diff, err := computeDiff(ctx, client, from, to, diffOptions(cmd, env)...)
+	to.Close()
+	from.Close()
+	if dev != nil {
+		dev.Close()
+	}
+	if err != nil {
+		return schemaApplyEnvPlan{}, err
+	}
+	if len(flags.include) > 0 {
+		diff.changes = filterTableChangesByInclude(diff.changes, flags.include)
+	}
+	diff.changes = orderChangesForApply(client, diff.changes)
+	if len(diff.changes) == 0 {
+		return schemaApplyEnvPlan{env: env, flags: flags}, nil
+	}
+	applyClient, err := sqlclient.Open(ctx, flags.url)
+	if err != nil {
+		return schemaApplyEnvPlan{}, err
+	}
+	return schemaApplyEnvPlan{
+		env:     env,
+		flags:   flags,
+		changes: diff.changes,
+		client:  applyClient,
+	}, nil
+}
+
+func printEnvPlanHeader(cmd *cobra.Command, env *Env, url string) {
+	cmd.Printf("Env: %s\n", env.Name)
+	if url == "" {
+		return
+	}
+	if u, err := cloudapi.RedactedURL(url); err == nil {
+		cmd.Printf("URL: %s\n", u)
 	}
 }
 
@@ -528,11 +721,213 @@ func summary(cmd *cobra.Command, c *sqlclient.Client, changes []schema.Change, t
 	)
 }
 
-func promptApply(cmd *cobra.Command, flags schemaApplyFlags, diff *diff, client, _ *sqlclient.Client) error {
+func promptApply(cmd *cobra.Command, flags schemaApplyFlags, diff *diff, client, _ *sqlclient.Client, env *Env) error {
+	if !flags.dryRun {
+		printTablePlanSummary(cmd, diff.changes)
+	}
 	if !flags.dryRun && (flags.autoApprove || promptUser(cmd)) {
-		return applyChanges(cmd.Context(), client, diff.changes, flags.txMode)
+		logApplyStart(cmd, env)
+		return applyChangesWithLogging(cmd.Context(), client, diff.changes, flags.txMode, func(ch schema.Change) {
+			logTableCreate(cmd, ch)
+		})
 	}
 	return nil
+}
+
+func printTablePlanSummary(cmd *cobra.Command, changes []schema.Change) {
+	adds, mods, drops := countTableChanges(changes)
+	printTablePlanSummaryWithCounts(cmd, adds, mods, drops)
+}
+
+func countTableChanges(changes []schema.Change) (adds, mods, drops int) {
+	for _, c := range changes {
+		switch c.(type) {
+		case *schema.AddTable:
+			adds++
+		case *schema.ModifyTable:
+			mods++
+		case *schema.DropTable:
+			drops++
+		}
+	}
+	return adds, mods, drops
+}
+
+func printTablePlanSummaryWithCounts(cmd *cobra.Command, adds, mods, drops int) {
+	if adds == 0 && mods == 0 && drops == 0 {
+		return
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Plan: %d to add, %d to change, %d to destroy tables.\n", adds, mods, drops)
+}
+
+func filterTableChangesByInclude(changes []schema.Change, include []string) []schema.Change {
+	if len(include) == 0 {
+		return changes
+	}
+	type pat struct {
+		schema string
+		table  string
+	}
+	var patterns []pat
+	for _, p := range include {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "table:") {
+			p = strings.TrimPrefix(p, "table:")
+		}
+		parts := strings.Split(p, ".")
+		switch len(parts) {
+		case 1:
+			patterns = append(patterns, pat{table: parts[0]})
+		default:
+			patterns = append(patterns, pat{schema: parts[0], table: parts[1]})
+		}
+	}
+	if len(patterns) == 0 {
+		return changes
+	}
+	matchTable := func(schemaName, tableName string) bool {
+		for _, p := range patterns {
+			if p.schema != "" && p.schema != "*" {
+				if ok, _ := filepath.Match(p.schema, schemaName); !ok {
+					continue
+				}
+			}
+			if p.table == "" {
+				continue
+			}
+			if p.table == "*" {
+				return true
+			}
+			if ok, _ := filepath.Match(p.table, tableName); ok {
+				return true
+			}
+		}
+		return false
+	}
+	filtered := changes[:0]
+	for _, c := range changes {
+		switch ch := c.(type) {
+		case *schema.AddTable:
+			if matchTable(schemaName(ch.T), ch.T.Name) {
+				filtered = append(filtered, c)
+			}
+		case *schema.ModifyTable:
+			if matchTable(schemaName(ch.T), ch.T.Name) {
+				filtered = append(filtered, c)
+			}
+		case *schema.DropTable:
+			if matchTable(schemaName(ch.T), ch.T.Name) {
+				filtered = append(filtered, c)
+			}
+		case *schema.RenameTable:
+			if (ch.From != nil && matchTable(schemaName(ch.From), ch.From.Name)) ||
+				(ch.To != nil && matchTable(schemaName(ch.To), ch.To.Name)) {
+				filtered = append(filtered, c)
+			}
+		}
+	}
+	return filtered
+}
+
+func schemaName(t *schema.Table) string {
+	if t != nil && t.Schema != nil {
+		return t.Schema.Name
+	}
+	return ""
+}
+
+func tableIdent(t *schema.Table) string {
+	if t == nil {
+		return ""
+	}
+	if t.Schema != nil && t.Schema.Name != "" {
+		return t.Schema.Name + "." + t.Name
+	}
+	return t.Name
+}
+
+func logApplyStart(cmd *cobra.Command, env *Env) {
+	if env != nil && env.Name != "" {
+		cmd.Printf("Applying changes for env: %s\n", env.Name)
+	}
+}
+
+func logTableCreate(cmd *cobra.Command, ch schema.Change) {
+	if add, ok := ch.(*schema.AddTable); ok {
+		cmd.Printf("Creating table: %s\n", tableIdent(add.T))
+	}
+}
+
+func applyChangesWithLogging(ctx context.Context, client *sqlclient.Client, changes []schema.Change, txMode string, logFn func(schema.Change)) error {
+	opts := planOptions(client)
+	if txMode == txModeNone {
+		for _, ch := range changes {
+			if logFn != nil {
+				logFn(ch)
+			}
+			if err := client.ApplyChanges(ctx, []schema.Change{ch}, opts...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	tx, err := client.Tx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, ch := range changes {
+		if logFn != nil {
+			logFn(ch)
+		}
+		if err := tx.ApplyChanges(ctx, []schema.Change{ch}, opts...); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func orderChangesForApply(client *sqlclient.Client, changes []schema.Change) []schema.Change {
+	if client == nil || strings.ToLower(client.Name) != "clickhouse" || len(changes) == 0 {
+		return changes
+	}
+	ordered := append([]schema.Change(nil), changes...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return changePriority(ordered[i]) < changePriority(ordered[j])
+	})
+	return ordered
+}
+
+func changePriority(c schema.Change) int {
+	switch ch := c.(type) {
+	case *schema.AddTable:
+		if isDistributedTable(ch.T) {
+			return 1
+		}
+		return 0
+	case *schema.AddView:
+		if ch.V != nil && ch.V.Materialized() {
+			return 3
+		}
+		return 2
+	default:
+		return 4
+	}
+}
+
+func isDistributedTable(t *schema.Table) bool {
+	if t == nil {
+		return false
+	}
+	for _, a := range t.Attrs {
+		if e, ok := a.(*clickhouse.Engine); ok {
+			return strings.HasPrefix(strings.TrimSpace(e.V), "Distributed(")
+		}
+	}
+	return false
 }
 
 func maySetLoginContext(*cobra.Command, *Project) error {
