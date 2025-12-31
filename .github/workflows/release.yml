@@ -21,7 +21,7 @@ jobs:
       - name: Build atlas (for tests)
         run: |
           mkdir -p .bin
-          go build -o .bin/atlas ./cmd/atlas
+          (cd cmd/atlas && go build -o ../../.bin/atlas .)
           echo "$PWD/.bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: go test -race ./...
