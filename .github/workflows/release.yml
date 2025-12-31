@@ -50,7 +50,7 @@ jobs:
           if [ "${GOOS}" = "windows" ]; then
             bin_name="${bin_name}.exe"
           fi
-          go build -o "dist/${bin_name}" ./cmd/atlas
+          (cd cmd/atlas && go build -o "../../dist/${bin_name}" .)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
