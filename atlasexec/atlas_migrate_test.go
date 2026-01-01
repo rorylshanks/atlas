@@ -295,27 +295,27 @@ func TestMigrate_Test(t *testing.T) {
 	}
 }
 
-// func TestAtlasMigrate_ApplyBroken(t *testing.T) {
-// 	c, err := atlasexec.NewClient(".", "atlas")
-// 	require.NoError(t, err)
-// 	got, err := c.MigrateApply(context.Background(), &atlasexec.MigrateApplyParams{
-// 		URL:    "sqlite://?mode=memory",
-// 		DirURL: "file://testdata/broken",
-// 	})
-// 	require.ErrorContains(t, err, `sql/migrate: executing statement "broken;" from version "20231029112426": near "broken": syntax error`)
-// 	require.Nil(t, got)
-// 	report, ok := err.(*atlasexec.MigrateApplyError)
-// 	require.True(t, ok)
-// 	require.Equal(t, "20231029112426", report.Result[0].Target)
-// 	require.Equal(t, "sql/migrate: executing statement \"broken;\" from version \"20231029112426\": near \"broken\": syntax error", report.Error())
-// 	require.Len(t, report.Result[0].Applied, 1)
-// 	require.Equal(t, &struct {
-// 		Stmt, Text string
-// 	}{
-// 		Stmt: "broken;",
-// 		Text: "near \"broken\": syntax error",
-// 	}, report.Result[0].Applied[0].Error)
-// }
+func TestAtlasMigrate_ApplyBroken(t *testing.T) {
+	c, err := atlasexec.NewClient(".", "atlas")
+	require.NoError(t, err)
+	got, err := c.MigrateApply(context.Background(), &atlasexec.MigrateApplyParams{
+		URL:    "sqlite://?mode=memory",
+		DirURL: "file://testdata/broken",
+	})
+	require.ErrorContains(t, err, `sql/migrate: executing statement "broken;" from version "20231029112426": near "broken": syntax error`)
+	require.Nil(t, got)
+	report, ok := err.(*atlasexec.MigrateApplyError)
+	require.True(t, ok)
+	require.Equal(t, "20231029112426", report.Result[0].Target)
+	require.Equal(t, "sql/migrate: executing statement \"broken;\" from version \"20231029112426\": near \"broken\": syntax error", report.Error())
+	require.Len(t, report.Result[0].Applied, 1)
+	require.Equal(t, &struct {
+		Stmt, Text string
+	}{
+		Stmt: "broken;",
+		Text: "near \"broken\": syntax error",
+	}, report.Result[0].Applied[0].Error)
+}
 
 func TestAtlasMigrate_Apply(t *testing.T) {
 	ec, err := atlasexec.NewWorkingDir(
