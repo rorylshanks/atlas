@@ -115,6 +115,15 @@ func (r *Resource) as(target any) error {
 			if field.Kind() != reflect.String {
 				return errors.New("schemahcl: extension isName field must be of type string")
 			}
+			if r.Name == "" {
+				if attr, ok := r.Attr(AttrName); ok {
+					if err := setField(field, attr); err != nil {
+						return err
+					}
+					delete(existingAttrs, attr.K)
+					break
+				}
+			}
 			field.SetString(r.Name)
 		case ft.isQualifier():
 			if seenQualifier {

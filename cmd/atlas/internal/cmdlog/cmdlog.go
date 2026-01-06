@@ -35,6 +35,7 @@ var (
 	ColorCyan         = color.CyanString
 	ColorGray         = color.New(color.Attribute(90))
 	ColorGreen        = color.HiGreenString
+	ColorBlue         = color.HiBlueString
 	ColorRed          = color.HiRedString
 	ColorRedBgWhiteFg = color.New(color.FgHiWhite, color.BgHiRed).SprintFunc()
 	ColorYellow       = color.YellowString
@@ -42,6 +43,7 @@ var (
 	ColorTemplateFuncs = template.FuncMap{
 		"cyan":         ColorCyan,
 		"green":        ColorGreen,
+		"blue":         ColorBlue,
 		"red":          ColorRed,
 		"redBgWhiteFg": ColorRedBgWhiteFg,
 		"yellow":       ColorYellow,

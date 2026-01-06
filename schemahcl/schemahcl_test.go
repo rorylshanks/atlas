@@ -591,6 +591,71 @@ table "s2" {
 `, string(buf))
 }
 
+func TestForEachNestedBlocks(t *testing.T) {
+	type (
+		Inner struct {
+			Name string `spec:"name"`
+			Val  string `spec:"val"`
+		}
+		Outer struct {
+			Name   string   `spec:",name"`
+			Inners []*Inner `spec:"inner"`
+		}
+	)
+	var (
+		doc struct {
+			Outer []*Outer `spec:"outer"`
+		}
+		b = []byte(`
+outer "o" {
+  inner {
+    for_each = {
+      a = "1"
+      b = "2"
+    }
+    name = each.key
+    val = each.value
+  }
+}
+`)
+	)
+	require.NoError(t, New().EvalBytes(b, &doc, nil))
+	require.Len(t, doc.Outer, 1)
+	require.Len(t, doc.Outer[0].Inners, 2)
+	got := make(map[string]string, len(doc.Outer[0].Inners))
+	for _, inner := range doc.Outer[0].Inners {
+		got[inner.Name] = inner.Val
+	}
+	require.Equal(t, map[string]string{
+		"a": "1",
+		"b": "2",
+	}, got)
+}
+
+func TestNameAttrWithoutLabel(t *testing.T) {
+	type (
+		Foo struct {
+			Name string `spec:",name"`
+			Bar  string `spec:"bar"`
+		}
+	)
+	var (
+		doc struct {
+			Foo []*Foo `spec:"foo"`
+		}
+		b = []byte(`
+foo {
+  name = "f1"
+  bar = "b1"
+}
+`)
+	)
+	require.NoError(t, New().EvalBytes(b, &doc, nil))
+	require.Len(t, doc.Foo, 1)
+	require.Equal(t, "f1", doc.Foo[0].Name)
+	require.Equal(t, "b1", doc.Foo[0].Bar)
+}
+
 func TestDataLocalsRefs(t *testing.T) {
 	var (
 		opts = []Option{

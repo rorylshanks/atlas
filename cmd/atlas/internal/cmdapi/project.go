@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -600,6 +601,9 @@ func EnvByName(cmd *cobra.Command, name string, vars map[string]cty.Value) (*Pro
 		e.Test = e.Test.Extend(project.Test)
 		envs[e.Name] = append(envs[e.Name], e)
 	}
+	if name != "" {
+		setImplicitAtlasNodes(envs[name], vars)
+	}
 	envsCache.store(GlobalFlags.ConfigURL, name, vars, project, envs[name])
 	switch {
 	case name == "":
@@ -610,6 +614,37 @@ func EnvByName(cmd *cobra.Command, name string, vars map[string]cty.Value) (*Pro
 		return nil, nil, fmt.Errorf("env %q not defined in config file", name)
 	default:
 		return project, envs[name], nil
+	}
+}
+
+func setImplicitAtlasNodes(envs []*Env, vars map[string]cty.Value) {
+	if len(envs) == 0 {
+		return
+	}
+	_, hasNode := vars["atlas_node"]
+	_, hasNodes := vars["atlas_nodes"]
+	if hasNode && hasNodes {
+		return
+	}
+	nodes := make([]string, 0, len(envs))
+	for i, e := range envs {
+		if e.URL != "" {
+			nodes = append(nodes, e.URL)
+		} else {
+			nodes = append(nodes, strconv.Itoa(i))
+		}
+	}
+	for i, e := range envs {
+		if !hasNode {
+			if _, ok := e.Attr("atlas_node"); !ok {
+				e.Extra.SetAttr(schemahcl.StringAttr("atlas_node", nodes[i]))
+			}
+		}
+		if !hasNodes {
+			if _, ok := e.Attr("atlas_nodes"); !ok {
+				e.Extra.SetAttr(schemahcl.StringsAttr("atlas_nodes", nodes...))
+			}
+		}
 	}
 }
 

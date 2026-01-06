@@ -7,6 +7,7 @@ package clickhouse
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -30,9 +31,6 @@ func (p *planApply) PlanChanges(ctx context.Context, name string, changes []sche
 		Plan: migrate.Plan{
 			Name:          name,
 			Transactional: false,
-		},
-		PlanOptions: migrate.PlanOptions{
-			SchemaQualifier: new(string),
 		},
 	}
 	for _, o := range opts {
@@ -165,6 +163,12 @@ func (s *state) dropTable(drop *schema.DropTable) {
 		b.P("IF EXISTS")
 	}
 	b.Table(drop.T)
+	if drop.T.Schema != nil {
+		var v MaxTableSizeToDrop
+		if sqlx.Has(drop.T.Schema.Attrs, &v) {
+			b.P("SETTINGS max_table_size_to_drop=" + strconv.Itoa(v.V))
+		}
+	}
 	s.append(&migrate.Change{
 		Cmd:     b.String(),
 		Source:  drop,
@@ -173,6 +177,10 @@ func (s *state) dropTable(drop *schema.DropTable) {
 }
 
 func (s *state) modifyTable(modify *schema.ModifyTable) error {
+	if requiresTableRecreate(modify.Changes) {
+		s.dropTable(&schema.DropTable{T: modify.T})
+		return s.addTable(&schema.AddTable{T: modify.T})
+	}
 	for _, change := range modify.Changes {
 		switch change := change.(type) {
 		case *schema.AddColumn:
@@ -192,11 +200,132 @@ func (s *state) modifyTable(modify *schema.ModifyTable) error {
 			if err := s.addIndex(modify.T, &schema.AddIndex{I: change.To}); err != nil {
 				return err
 			}
+		case *schema.AddAttr:
+			if settings, ok := change.A.(*EngineSettings); ok {
+				if err := s.applySettingsDiff(modify.T, "", settings.V, change); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("clickhouse: unsupported add attribute %T", change.A)
+		case *schema.DropAttr:
+			if settings, ok := change.A.(*EngineSettings); ok {
+				if err := s.applySettingsDiff(modify.T, settings.V, "", change); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("clickhouse: unsupported drop attribute %T", change.A)
+		case *schema.ModifyAttr:
+			fromSettings, okFrom := change.From.(*EngineSettings)
+			toSettings, okTo := change.To.(*EngineSettings)
+			if okFrom && okTo {
+				if err := s.applySettingsDiff(modify.T, fromSettings.V, toSettings.V, change); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("clickhouse: unsupported modify attribute %T", change.To)
 		default:
 			return fmt.Errorf("clickhouse: unsupported modify change %T", change)
 		}
 	}
 	return nil
+}
+
+func requiresTableRecreate(changes []schema.Change) bool {
+	for _, change := range changes {
+		switch change := change.(type) {
+		case *schema.AddAttr:
+			if isEngineAttr(change.A) {
+				return true
+			}
+		case *schema.DropAttr:
+			if isEngineAttr(change.A) {
+				return true
+			}
+		case *schema.ModifyAttr:
+			if isEngineAttr(change.From) || isEngineAttr(change.To) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *state) applySettingsDiff(t *schema.Table, from, to string, source schema.Change) error {
+	modify, reset, err := diffSettings(from, to)
+	if err != nil {
+		return err
+	}
+	if len(modify) > 0 {
+		b := s.Build("ALTER TABLE").Table(t).P("MODIFY SETTING")
+		b.WriteString(strings.Join(modify, ", "))
+		s.append(&migrate.Change{
+			Cmd:     b.String(),
+			Source:  source,
+			Comment: fmt.Sprintf("modify settings on %q table", t.Name),
+		})
+	}
+	if len(reset) > 0 {
+		b := s.Build("ALTER TABLE").Table(t).P("RESET SETTING")
+		b.WriteString(strings.Join(reset, ", "))
+		s.append(&migrate.Change{
+			Cmd:     b.String(),
+			Source:  source,
+			Comment: fmt.Sprintf("reset settings on %q table", t.Name),
+		})
+	}
+	return nil
+}
+
+func diffSettings(from, to string) (modify, reset []string, err error) {
+	fromMap, err := parseSettings(from)
+	if err != nil {
+		return nil, nil, err
+	}
+	toMap, err := parseSettings(to)
+	if err != nil {
+		return nil, nil, err
+	}
+	for name, toVal := range toMap {
+		if fromVal, ok := fromMap[name]; !ok || strings.TrimSpace(fromVal) != strings.TrimSpace(toVal) {
+			modify = append(modify, name+"="+strings.TrimSpace(toVal))
+		}
+	}
+	for name := range fromMap {
+		if _, ok := toMap[name]; !ok {
+			reset = append(reset, name)
+		}
+	}
+	sort.Strings(modify)
+	sort.Strings(reset)
+	return modify, reset, nil
+}
+
+func parseSettings(v string) (map[string]string, error) {
+	out := make(map[string]string)
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return out, nil
+	}
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(part, "=")
+		if idx == -1 {
+			return nil, fmt.Errorf("clickhouse: invalid settings %q", v)
+		}
+		name := strings.TrimSpace(part[:idx])
+		val := strings.TrimSpace(part[idx+1:])
+		if name == "" {
+			return nil, fmt.Errorf("clickhouse: invalid settings %q", v)
+		}
+		out[name] = val
+	}
+	return out, nil
 }
 
 func (s *state) addColumn(t *schema.Table, add *schema.AddColumn) error {
@@ -472,6 +601,7 @@ func engineClauseWithOptions(engine, partitionBy, orderBy, ttl, settings string)
 	}
 	return b.String()
 }
+
 
 func viewCreateKeyword(v *schema.View) string {
 	if v.Materialized() {

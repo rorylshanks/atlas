@@ -2,3 +2,7 @@
 .gopath
 .bin
 examples
+posthog
+current.hcl
+client.properties
+offsets.csv

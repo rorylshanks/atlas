@@ -18,6 +18,7 @@ import (
 	"testing"
 	"text/template"
 	"time"
+	"unicode"
 
 	"ariga.io/atlas/cmd/atlas/internal/cloudapi"
 	"ariga.io/atlas/cmd/atlas/internal/cmdext"
@@ -356,8 +357,7 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		dev    *sqlclient.Client
 		format = cmdlog.SchemaPlanTemplate
 	)
-	printEnvPlanHeader(cmd, env, flags.url)
-	cmd.Println("Planning: inspect current state and load desired schema.")
+	logInspectStart(cmd, flags.url)
 	if err = flags.check(env); err != nil {
 		return err
 	}
@@ -400,6 +400,7 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		return err
 	}
 	defer to.Close()
+	to = wrapStateReaderNodeLimits(to, envNodeName(env))
 	diff, err := computeDiff(ctx, client, from, to, diffOptions(cmd, env)...)
 	if err != nil {
 		return err
@@ -408,13 +409,15 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		diff.changes = filterTableChangesByInclude(diff.changes, flags.include)
 	}
 	diff.changes = orderChangesForApply(client, diff.changes)
+	logInspectDone(cmd, flags.url)
 	maySuggestUpgrade(cmd)
 	// Returning at this stage should
 	// not trigger the help message.
 	cmd.SilenceUsage = true
 	switch changes := diff.changes; {
 	case len(changes) == 0:
-		return format.Execute(cmd.OutOrStdout(), &cmdlog.SchemaApply{})
+		cmd.Printf("%sNo changes.\n", hostPrefix(hostFromURL(flags.url)))
+		return nil
 	case flags.logFormat != "" && flags.autoApprove:
 		var (
 			applied int
@@ -425,7 +428,7 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		if plan, err = client.PlanChanges(ctx, "", changes, planOptions(client)...); err != nil {
 			return err
 		}
-		logApplyStart(cmd, env)
+		logApplyStart(cmd, env, hostFromURL(flags.url))
 		if err = applyChangesWithLogging(ctx, client, changes, flags.txMode, nil); err == nil {
 			applied = len(plan.Changes)
 		} else if i, ok := err.(interface{ Applied() int }); ok && i.Applied() < len(plan.Changes) {
@@ -436,15 +439,19 @@ func schemaApplyRun(cmd *cobra.Command, flags schemaApplyFlags, env *Env) error 
 		err1 := format.Execute(out, cmdlog.NewSchemaApply(ctx, cmdlog.NewEnv(client, nil), plan.Changes[:applied], plan.Changes[applied:], cause))
 		return errors.Join(err, err1)
 	default:
-		switch err := summary(cmd, client, changes, format); {
+		switch err := printSchemaPlan(cmd, env, client, changes, format, flags.verbose); {
 		case err != nil:
 			return err
 		case flags.dryRun:
 			return nil
 		case flags.autoApprove:
-			logApplyStart(cmd, env)
+			host := hostFromURL(flags.url)
+			logApplyStart(cmd, env, host)
+			pairs := recreatePairs(changes)
+			var idx int
 			return applyChangesWithLogging(ctx, client, changes, flags.txMode, func(ch schema.Change) {
-				logTableCreate(cmd, ch)
+				logApplyChange(cmd, host, ch, pairs, idx)
+				idx++
 			})
 		default:
 			return promptApply(cmd, flags, diff, client, dev, env)
@@ -465,14 +472,10 @@ func schemaApplyRunMulti(cmd *cobra.Command, flags *schemaApplyFlags, envs []*En
 		reset    = resetFromEnv(cmd)
 		hasPlans bool
 		plans    []schemaApplyEnvPlan
-		totalAdd int
-		totalMod int
-		totalDel int
 	)
 	defer reset()
 	for _, env := range envs {
-		printEnvPlanHeader(cmd, env, env.URL)
-		cmd.Println("Planning: inspect current state and load desired schema.")
+		logInspectStart(cmd, env.URL)
 		if err := setSchemaEnvFlags(cmd, env); err != nil {
 			return err
 		}
@@ -481,6 +484,7 @@ func schemaApplyRunMulti(cmd *cobra.Command, flags *schemaApplyFlags, envs []*En
 		if err != nil {
 			return err
 		}
+		logInspectDone(cmd, env.URL)
 		if len(plan.changes) > 0 {
 			hasPlans = true
 		}
@@ -488,23 +492,17 @@ func schemaApplyRunMulti(cmd *cobra.Command, flags *schemaApplyFlags, envs []*En
 		reset()
 	}
 	for _, plan := range plans {
-		printEnvPlanHeader(cmd, plan.env, plan.flags.url)
-		adds, mods, drops := countTableChanges(plan.changes)
-		totalAdd += adds
-		totalMod += mods
-		totalDel += drops
-		printTablePlanSummaryWithCounts(cmd, adds, mods, drops)
 		switch {
 		case len(plan.changes) == 0:
-			cmd.Println("No changes.")
+			cmd.Printf("%sNo changes.\n", hostPrefix(hostFromURL(plan.flags.url)))
 		default:
-			if err := summary(cmd, plan.client, plan.changes, cmdlog.SchemaPlanTemplate); err != nil {
+			if err := printSchemaPlan(cmd, plan.env, plan.client, plan.changes, cmdlog.SchemaPlanTemplate, flags.verbose); err != nil {
 				return err
 			}
 		}
 		cmd.Println()
 	}
-	printTablePlanSummaryWithCounts(cmd, totalAdd, totalMod, totalDel)
+	printPlanSummaryByHost(cmd, plans)
 	cmd.Println()
 	if !hasPlans || flags.dryRun {
 		for i := range plans {
@@ -530,9 +528,13 @@ func schemaApplyRunMulti(cmd *cobra.Command, flags *schemaApplyFlags, envs []*En
 			}
 			continue
 		}
-		logApplyStart(cmd, p.env)
+		host := hostFromURL(p.flags.url)
+		logApplyStart(cmd, p.env, host)
+		pairs := recreatePairs(p.changes)
+		var idx int
 		if err := applyChangesWithLogging(ctx, p.client, p.changes, p.flags.txMode, func(ch schema.Change) {
-			logTableCreate(cmd, ch)
+			logApplyChange(cmd, host, ch, pairs, idx)
+			idx++
 		}); err != nil {
 			_ = p.client.Close()
 			return err
@@ -589,6 +591,7 @@ func planSchemaApply(ctx context.Context, cmd *cobra.Command, env *Env, flags sc
 		from.Close()
 		return schemaApplyEnvPlan{}, err
 	}
+	to = wrapStateReaderNodeLimits(to, envNodeName(env))
 	diff, err := computeDiff(ctx, client, from, to, diffOptions(cmd, env)...)
 	to.Close()
 	from.Close()
@@ -615,16 +618,6 @@ func planSchemaApply(ctx context.Context, cmd *cobra.Command, env *Env, flags sc
 		changes: diff.changes,
 		client:  applyClient,
 	}, nil
-}
-
-func printEnvPlanHeader(cmd *cobra.Command, env *Env, url string) {
-	cmd.Printf("Env: %s\n", env.Name)
-	if url == "" {
-		return
-	}
-	if u, err := cloudapi.RedactedURL(url); err == nil {
-		cmd.Printf("URL: %s\n", u)
-	}
 }
 
 // applySchemaClean is the community-version of the 'atlas schema clean' handler.
@@ -700,6 +693,7 @@ func schemaDiffRun(cmd *cobra.Command, _ []string, flags schemaDiffFlags, env *E
 			return fmt.Errorf("parse log format: %w", err)
 		}
 	}
+	to = wrapStateReaderNodeLimits(to, envNodeName(env))
 	diff, err := computeDiff(ctx, c, from, to, diffOptions(cmd, env)...)
 	if err != nil {
 		return err
@@ -723,12 +717,16 @@ func summary(cmd *cobra.Command, c *sqlclient.Client, changes []schema.Change, t
 
 func promptApply(cmd *cobra.Command, flags schemaApplyFlags, diff *diff, client, _ *sqlclient.Client, env *Env) error {
 	if !flags.dryRun {
-		printTablePlanSummary(cmd, diff.changes)
+		printPlanSummary(cmd, env, diff.changes)
 	}
 	if !flags.dryRun && (flags.autoApprove || promptUser(cmd)) {
-		logApplyStart(cmd, env)
+		host := hostFromURL(flags.url)
+		logApplyStart(cmd, env, host)
+		pairs := recreatePairs(diff.changes)
+		var idx int
 		return applyChangesWithLogging(cmd.Context(), client, diff.changes, flags.txMode, func(ch schema.Change) {
-			logTableCreate(cmd, ch)
+			logApplyChange(cmd, host, ch, pairs, idx)
+			idx++
 		})
 	}
 	return nil
@@ -832,6 +830,85 @@ func filterTableChangesByInclude(changes []schema.Change, include []string) []sc
 	return filtered
 }
 
+func envNodeName(env *Env) string {
+	if env == nil {
+		return ""
+	}
+	attr, ok := env.Attr("node_name")
+	if !ok {
+		return ""
+	}
+	v, err := attr.String()
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
+func nodeLimitsFromAttrs(attrs []schema.Attr) ([]string, bool) {
+	for _, attr := range attrs {
+		if limits, ok := attr.(*clickhouse.NodeLimits); ok {
+			return limits.V, true
+		}
+	}
+	return nil, false
+}
+
+func nodeNameAllowed(nodeName string, limits []string) bool {
+	if nodeName == "" {
+		return true
+	}
+	for _, limit := range limits {
+		if limit == "*" || limit == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+func wrapStateReaderNodeLimits(sr *cmdext.StateReadCloser, nodeName string) *cmdext.StateReadCloser {
+	if nodeName == "" || sr == nil {
+		return sr
+	}
+	return &cmdext.StateReadCloser{
+		StateReader: migrate.StateReaderFunc(func(ctx context.Context) (*schema.Realm, error) {
+			realm, err := sr.ReadState(ctx)
+			if err != nil {
+				return nil, err
+			}
+			filterRealmByNodeLimits(realm, nodeName)
+			return realm, nil
+		}),
+		Closer: sr.Closer,
+		Schema: sr.Schema,
+		HCL:    sr.HCL,
+	}
+}
+
+func filterRealmByNodeLimits(realm *schema.Realm, nodeName string) {
+	if realm == nil || nodeName == "" {
+		return
+	}
+	for _, s := range realm.Schemas {
+		tables := s.Tables[:0]
+		for _, t := range s.Tables {
+			if limits, ok := nodeLimitsFromAttrs(t.Attrs); ok && !nodeNameAllowed(nodeName, limits) {
+				continue
+			}
+			tables = append(tables, t)
+		}
+		s.Tables = tables
+		views := s.Views[:0]
+		for _, v := range s.Views {
+			if limits, ok := nodeLimitsFromAttrs(v.Attrs); ok && !nodeNameAllowed(nodeName, limits) {
+				continue
+			}
+			views = append(views, v)
+		}
+		s.Views = views
+	}
+}
+
 func schemaName(t *schema.Table) string {
 	if t != nil && t.Schema != nil {
 		return t.Schema.Name
@@ -849,16 +926,668 @@ func tableIdent(t *schema.Table) string {
 	return t.Name
 }
 
-func logApplyStart(cmd *cobra.Command, env *Env) {
+func viewIdent(v *schema.View) string {
+	if v == nil {
+		return ""
+	}
+	if v.Schema != nil && v.Schema.Name != "" {
+		return v.Schema.Name + "." + v.Name
+	}
+	return v.Name
+}
+
+func logInspectStart(cmd *cobra.Command, rawURL string) {
+	cmd.Printf("Inspecting current schema in %s\n", redactedURL(rawURL))
+}
+
+func logInspectDone(cmd *cobra.Command, rawURL string) {
+	cmd.Printf("Finished inspecting schema in %s\n", redactedURL(rawURL))
+}
+
+func logApplyStart(cmd *cobra.Command, env *Env, host string) {
 	if env != nil && env.Name != "" {
-		cmd.Printf("Applying changes for env: %s\n", env.Name)
+		cmd.Printf("%sApplying changes for env: %s\n", hostPrefix(host), env.Name)
 	}
 }
 
-func logTableCreate(cmd *cobra.Command, ch schema.Change) {
-	if add, ok := ch.(*schema.AddTable); ok {
-		cmd.Printf("Creating table: %s\n", tableIdent(add.T))
+func logApplyChange(cmd *cobra.Command, host string, ch schema.Change, pairs map[int]recreatePair, idx int) {
+	action, target, colorFn, _, ok := summarizeChange(ch, pairs, idx)
+	if !ok {
+		return
 	}
+	cmd.Printf("%s%s %s\n", hostPrefix(host), colorFn(action), target)
+}
+
+func printSchemaPlan(cmd *cobra.Command, env *Env, client *sqlclient.Client, changes []schema.Change, tpl *template.Template, verbose bool) error {
+	if tpl != cmdlog.SchemaPlanTemplate || verbose {
+		return summary(cmd, client, changes, tpl)
+	}
+	host := hostFromURL("")
+	if env != nil {
+		host = hostFromURL(env.URL)
+	}
+	printCompactPlan(cmd, host, changes)
+	return nil
+}
+
+func printCompactPlan(cmd *cobra.Command, host string, changes []schema.Change) {
+	pairs := recreatePairs(changes)
+	gray := cmdlog.ColorGray.SprintFunc()
+	for i, ch := range changes {
+		if pair, ok := pairs[i]; ok {
+			if pair.skip {
+				continue
+			}
+		}
+		action, target, colorFn, details, ok := summarizeChange(ch, pairs, i)
+		if !ok {
+			continue
+		}
+		cmd.Printf("%s%s %s\n", hostPrefix(host), colorFn(action), target)
+		for _, d := range details {
+			cmd.Printf("%s  %s\n", hostPrefix(host), gray(d))
+		}
+	}
+}
+
+func printPlanSummary(cmd *cobra.Command, env *Env, changes []schema.Change) {
+	host := hostFromURL("")
+	if env != nil {
+		host = hostFromURL(env.URL)
+	}
+	cmd.Println("Plan:")
+	if host != "" {
+		cmd.Printf("  %s\n", host)
+	}
+	printPlanSummaryCounts(cmd, host, countChanges(changes))
+}
+
+func printPlanSummaryByHost(cmd *cobra.Command, plans []schemaApplyEnvPlan) {
+	if len(plans) == 0 {
+		return
+	}
+	type hostPlan struct {
+		host  string
+		count changeCounts
+	}
+	var (
+		hostMap = make(map[string]changeCounts)
+		hosts   []string
+	)
+	for _, plan := range plans {
+		host := hostFromURL(plan.flags.url)
+		if _, ok := hostMap[host]; !ok {
+			hosts = append(hosts, host)
+		}
+		hostMap[host] = hostMap[host].add(countChanges(plan.changes))
+	}
+	sort.Strings(hosts)
+	cmd.Println("Plan:")
+	for _, host := range hosts {
+		cmd.Printf("  %s\n", host)
+		printPlanSummaryCounts(cmd, host, hostMap[host])
+	}
+}
+
+func printPlanSummaryCounts(cmd *cobra.Command, host string, counts changeCounts) {
+	indent := "    "
+	if host == "" {
+		indent = "  "
+	}
+	if counts.recreates > 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "%sadd: %d, change: %d, recreate: %d, destroy: %d\n", indent, counts.adds, counts.mods, counts.recreates, counts.drops)
+		return
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%sadd: %d, change: %d, destroy: %d\n", indent, counts.adds, counts.mods, counts.drops)
+}
+
+func summarizeChange(ch schema.Change, pairs map[int]recreatePair, idx int) (string, string, func(string) string, []string, bool) {
+	switch c := ch.(type) {
+	case *schema.AddTable:
+		if pair, ok := pairs[idx]; ok && pair.recreate {
+			return "RECREATE TABLE", tableIdent(c.T), colorWrap(cmdlog.ColorBlue), []string{"drop + create"}, true
+		}
+		return "CREATE TABLE", tableIdent(c.T), colorWrap(cmdlog.ColorGreen), nil, true
+	case *schema.DropTable:
+		if pair, ok := pairs[idx]; ok && pair.skip {
+			return "", "", nil, nil, false
+		}
+		return "DROP TABLE", tableIdent(c.T), colorWrap(cmdlog.ColorRed), nil, true
+	case *schema.ModifyTable:
+		if hasClickhouseEngineAttrChange(c.Changes) {
+			details := tableChangeDetails(c.Changes)
+			details = append(details, "drop + create")
+			return "RECREATE TABLE", tableIdent(c.T), colorWrap(cmdlog.ColorBlue), details, true
+		}
+		return "UPDATE TABLE", tableIdent(c.T), colorWrap(cmdlog.ColorYellow), tableChangeDetails(c.Changes), true
+	case *schema.RenameTable:
+		return "RENAME TABLE", tableIdent(c.From) + " -> " + tableIdent(c.To), colorWrap(cmdlog.ColorBlue), nil, true
+	case *schema.AddView:
+		if pair, ok := pairs[idx]; ok && pair.recreate {
+			return viewAction("RECREATE", c.V), viewIdent(c.V), colorWrap(cmdlog.ColorBlue), []string{"drop + create"}, true
+		}
+		return viewAction("CREATE", c.V), viewIdent(c.V), colorWrap(cmdlog.ColorGreen), nil, true
+	case *schema.DropView:
+		if pair, ok := pairs[idx]; ok && pair.skip {
+			return "", "", nil, nil, false
+		}
+		return viewAction("DROP", c.V), viewIdent(c.V), colorWrap(cmdlog.ColorRed), nil, true
+	case *schema.ModifyView:
+		if c.To != nil && c.To.Materialized() {
+			details := viewChangeDetails(c)
+			details = append(details, "drop + create")
+			return viewAction("RECREATE", c.To), viewIdent(c.To), colorWrap(cmdlog.ColorBlue), details, true
+		}
+		return viewAction("UPDATE", c.To), viewIdent(c.To), colorWrap(cmdlog.ColorYellow), viewChangeDetails(c), true
+	case *schema.RenameView:
+		return viewAction("RENAME", c.From), viewIdent(c.From) + " -> " + viewIdent(c.To), colorWrap(cmdlog.ColorBlue), nil, true
+	case *schema.AddSchema:
+		return "CREATE DATABASE", c.S.Name, colorWrap(cmdlog.ColorGreen), nil, true
+	case *schema.DropSchema:
+		return "DROP DATABASE", c.S.Name, colorWrap(cmdlog.ColorRed), nil, true
+	case *schema.ModifySchema:
+		return "UPDATE DATABASE", c.S.Name, colorWrap(cmdlog.ColorYellow), nil, true
+	default:
+		return "", "", nil, nil, false
+	}
+}
+
+func colorWrap(fn func(format string, a ...interface{}) string) func(string) string {
+	return func(s string) string {
+		return fn("%s", s)
+	}
+}
+
+type recreatePair struct {
+	recreate bool
+	skip     bool
+}
+
+func recreatePairs(changes []schema.Change) map[int]recreatePair {
+	seenAdd := make(map[string]int)
+	seenDrop := make(map[string]int)
+	pairs := make(map[int]recreatePair)
+	for i, ch := range changes {
+		switch c := ch.(type) {
+		case *schema.AddTable:
+			seenAdd["table:"+tableKey(c.T)] = i
+		case *schema.DropTable:
+			seenDrop["table:"+tableKey(c.T)] = i
+		case *schema.AddView:
+			seenAdd["view:"+viewKey(c.V)] = i
+		case *schema.DropView:
+			seenDrop["view:"+viewKey(c.V)] = i
+		}
+	}
+	for k, addIdx := range seenAdd {
+		if dropIdx, ok := seenDrop[k]; ok {
+			pairs[dropIdx] = recreatePair{skip: true}
+			pairs[addIdx] = recreatePair{recreate: true}
+		}
+	}
+	return pairs
+}
+
+func tableKey(t *schema.Table) string {
+	if t == nil {
+		return ""
+	}
+	if t.Schema != nil && t.Schema.Name != "" {
+		return t.Schema.Name + "." + t.Name
+	}
+	return t.Name
+}
+
+func viewKey(v *schema.View) string {
+	if v == nil {
+		return ""
+	}
+	if v.Schema != nil && v.Schema.Name != "" {
+		return v.Schema.Name + "." + v.Name
+	}
+	return v.Name
+}
+
+func tableChangeDetails(changes []schema.Change) []string {
+	var details []string
+	for _, ch := range changes {
+		switch c := ch.(type) {
+		case *schema.AddColumn:
+			details = append(details, "+ column "+c.C.Name+formatColumnType(c.C))
+		case *schema.DropColumn:
+			details = append(details, "- column "+c.C.Name)
+		case *schema.ModifyColumn:
+			details = append(details, "~ column "+c.To.Name+formatColumnTypeChange(c.From, c.To))
+		case *schema.RenameColumn:
+			details = append(details, "~ column "+c.From.Name+" -> "+c.To.Name)
+		case *schema.AddIndex:
+			details = append(details, "+ index "+indexName(c.I))
+		case *schema.DropIndex:
+			details = append(details, "- index "+indexName(c.I))
+		case *schema.ModifyIndex:
+			details = append(details, "~ index "+indexName(c.To))
+		case *schema.RenameIndex:
+			details = append(details, "~ index "+indexName(c.From)+" -> "+indexName(c.To))
+		case *schema.AddPrimaryKey:
+			details = append(details, "+ primary key")
+		case *schema.DropPrimaryKey:
+			details = append(details, "- primary key")
+		case *schema.ModifyPrimaryKey:
+			details = append(details, "~ primary key")
+		case *schema.AddCheck:
+			details = append(details, "+ check "+c.C.Name)
+		case *schema.DropCheck:
+			details = append(details, "- check "+c.C.Name)
+		case *schema.ModifyCheck:
+			details = append(details, "~ check "+c.To.Name)
+		case *schema.AddForeignKey:
+			details = append(details, "+ foreign key "+fkName(c.F))
+		case *schema.DropForeignKey:
+			details = append(details, "- foreign key "+fkName(c.F))
+		case *schema.ModifyForeignKey:
+			details = append(details, "~ foreign key "+fkName(c.To))
+		case *schema.AddAttr:
+			if key, value, ok := clickhouseTableAttr(c.A); ok {
+				if v := strings.TrimSpace(value); v != "" {
+					details = append(details, "+ "+key+": "+v)
+				}
+			}
+		case *schema.DropAttr:
+			if key, value, ok := clickhouseTableAttr(c.A); ok {
+				if v := strings.TrimSpace(value); v != "" {
+					details = append(details, "- "+key+": "+v)
+				}
+			}
+		case *schema.ModifyAttr:
+			keyFrom, valueFrom, okFrom := clickhouseTableAttr(c.From)
+			keyTo, valueTo, okTo := clickhouseTableAttr(c.To)
+			if okFrom && okTo && keyFrom == keyTo {
+				change := formatAttrChange(strings.TrimSpace(valueFrom), strings.TrimSpace(valueTo))
+				if change != "" {
+					details = append(details, "~ "+keyFrom+": "+change)
+				}
+			}
+		}
+	}
+	return details
+}
+
+func viewChangeDetails(ch *schema.ModifyView) []string {
+	var details []string
+	if ch == nil {
+		return details
+	}
+	if ch.From != nil && ch.To != nil {
+		if strings.TrimSpace(ch.From.Def) != strings.TrimSpace(ch.To.Def) {
+			details = append(details, "~ def: "+diffSnippet(ch.From.Def, ch.To.Def))
+		}
+		fromAttrs := clickhouseViewAttrs(ch.From)
+		toAttrs := clickhouseViewAttrs(ch.To)
+		for _, k := range []string{"engine", "partition_by", "order_by", "ttl", "settings", "to"} {
+			if strings.TrimSpace(fromAttrs[k]) != strings.TrimSpace(toAttrs[k]) {
+				if change := formatViewAttrChange(k, fromAttrs[k], toAttrs[k]); change != "" {
+					details = append(details, "~ "+k+": "+change)
+				}
+			}
+		}
+	}
+	if len(ch.Changes) > 0 {
+		details = append(details, tableChangeDetails(ch.Changes)...)
+	}
+	return details
+}
+
+func formatColumnType(c *schema.Column) string {
+	if c == nil || c.Type == nil {
+		return ""
+	}
+	if c.Type.Raw != "" {
+		return " " + c.Type.Raw
+	}
+	return " " + typeName(c.Type.Type)
+}
+
+func formatColumnTypeChange(from, to *schema.Column) string {
+	fromT := formatColumnType(from)
+	toT := formatColumnType(to)
+	if fromT == toT || toT == "" {
+		return ""
+	}
+	if fromT == "" {
+		return " " + toT
+	}
+	return " " + strings.TrimSpace(fromT) + " -> " + strings.TrimSpace(toT)
+}
+
+func clickhouseViewAttrs(v *schema.View) map[string]string {
+	out := make(map[string]string)
+	if v == nil {
+		return out
+	}
+	for _, attr := range v.Attrs {
+		switch a := attr.(type) {
+		case *clickhouse.Engine:
+			out["engine"] = a.V
+		case *clickhouse.EnginePartitionBy:
+			out["partition_by"] = a.V
+		case *clickhouse.EngineOrderBy:
+			out["order_by"] = a.V
+		case *clickhouse.EngineTTL:
+			out["ttl"] = a.V
+		case *clickhouse.EngineSettings:
+			out["settings"] = a.V
+		case *clickhouse.MaterializedViewTo:
+			out["to"] = a.V
+		}
+	}
+	return out
+}
+
+func clickhouseTableAttr(attr schema.Attr) (string, string, bool) {
+	switch a := attr.(type) {
+	case *clickhouse.Engine:
+		return "engine", a.V, true
+	case *clickhouse.EnginePartitionBy:
+		return "partition_by", a.V, true
+	case *clickhouse.EngineOrderBy:
+		return "order_by", a.V, true
+	case *clickhouse.EngineTTL:
+		return "ttl", a.V, true
+	case *clickhouse.EngineSettings:
+		return "settings", a.V, true
+	default:
+		return "", "", false
+	}
+}
+
+func clickhouseRecreateAttr(attr schema.Attr) bool {
+	switch attr.(type) {
+	case *clickhouse.Engine, *clickhouse.EnginePartitionBy, *clickhouse.EngineOrderBy, *clickhouse.EngineTTL:
+		return true
+	default:
+		return false
+	}
+}
+
+func hasClickhouseEngineAttrChange(changes []schema.Change) bool {
+	for _, ch := range changes {
+		switch c := ch.(type) {
+		case *schema.AddAttr:
+			if clickhouseRecreateAttr(c.A) {
+				return true
+			}
+		case *schema.DropAttr:
+			if clickhouseRecreateAttr(c.A) {
+				return true
+			}
+		case *schema.ModifyAttr:
+			if clickhouseRecreateAttr(c.From) {
+				return true
+			}
+			if clickhouseRecreateAttr(c.To) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func formatAttrChange(from, to string) string {
+	switch {
+	case from == "" && to == "":
+		return ""
+	case from == "":
+		return to
+	case to == "":
+		return from + " -> (removed)"
+	default:
+		return from + " -> " + to
+	}
+}
+
+func formatViewAttrChange(key, from, to string) string {
+	switch key {
+	case "to":
+		left := formatToTarget(from)
+		right := formatToTarget(to)
+		if left == right {
+			return ""
+		}
+		return left + " -> " + right
+	default:
+		return formatAttrChange(from, to)
+	}
+}
+
+func formatToTarget(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "(none)"
+	}
+	name := v
+	if i := strings.IndexAny(v, " ("); i != -1 {
+		name = strings.TrimSpace(v[:i])
+	}
+	if name == "" {
+		name = "(unknown)"
+	}
+	if cols := countTopLevelCols(v); cols > 0 {
+		return fmt.Sprintf("%s (cols:%d)", name, cols)
+	}
+	return name
+}
+
+func countTopLevelCols(v string) int {
+	start := strings.Index(v, "(")
+	end := strings.LastIndex(v, ")")
+	if start == -1 || end == -1 || end <= start {
+		return 0
+	}
+	s := v[start+1 : end]
+	var (
+		depth  int
+		commas int
+		hasCol bool
+	)
+	for _, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				commas++
+			}
+		default:
+			if !hasCol && !unicode.IsSpace(r) {
+				hasCol = true
+			}
+		}
+	}
+	if !hasCol {
+		return 0
+	}
+	return commas + 1
+}
+
+func diffSnippet(from, to string) string {
+	a := strings.TrimSpace(from)
+	b := strings.TrimSpace(to)
+	p := commonPrefixLen(a, b)
+	s := commonSuffixLen(a, b)
+	aMid, bMid := trimDiff(a, b, p, s, 40)
+	return fmt.Sprintf("%s -> %s", aMid, bMid)
+}
+
+func commonPrefixLen(a, b string) int {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
+}
+
+func commonSuffixLen(a, b string) int {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[len(a)-1-i] == b[len(b)-1-i] {
+		i++
+	}
+	return i
+}
+
+func trimDiff(a, b string, prefix, suffix, keep int) (string, string) {
+	aMid := a[prefix : len(a)-suffix]
+	bMid := b[prefix : len(b)-suffix]
+	return shortenMid(aMid, keep), shortenMid(bMid, keep)
+}
+
+func shortenMid(s string, keep int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= keep*2 {
+		return s
+	}
+	return s[:keep] + "..." + s[len(s)-keep:]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func typeName(t schema.Type) string {
+	if t == nil {
+		return ""
+	}
+	tt := fmt.Sprintf("%T", t)
+	return strings.TrimPrefix(tt, "*")
+}
+
+func indexName(i *schema.Index) string {
+	if i == nil || i.Name == "" {
+		return "(unnamed)"
+	}
+	return i.Name
+}
+
+func fkName(f *schema.ForeignKey) string {
+	if f == nil || f.Symbol == "" {
+		return "(unnamed)"
+	}
+	return f.Symbol
+}
+
+func viewAction(verb string, v *schema.View) string {
+	if v != nil && v.Materialized() {
+		return verb + " MATERIALIZED VIEW"
+	}
+	return verb + " VIEW"
+}
+
+type changeCounts struct {
+	adds      int
+	mods      int
+	drops     int
+	recreates int
+}
+
+func (c changeCounts) add(other changeCounts) changeCounts {
+	return changeCounts{
+		adds:      c.adds + other.adds,
+		mods:      c.mods + other.mods,
+		drops:     c.drops + other.drops,
+		recreates: c.recreates + other.recreates,
+	}
+}
+
+func countChanges(changes []schema.Change) changeCounts {
+	var c changeCounts
+	pairs := recreatePairs(changes)
+	for i, ch := range changes {
+		switch ch.(type) {
+		case *schema.AddTable:
+			if pair, ok := pairs[i]; ok && pair.recreate {
+				c.recreates++
+				continue
+			}
+			c.adds++
+		case *schema.AddView:
+			if pair, ok := pairs[i]; ok && pair.recreate {
+				c.recreates++
+				continue
+			}
+			c.adds++
+		case *schema.AddSchema:
+			c.adds++
+		case *schema.DropTable:
+			if pair, ok := pairs[i]; ok && pair.skip {
+				continue
+			}
+			c.drops++
+		case *schema.DropView:
+			if pair, ok := pairs[i]; ok && pair.skip {
+				continue
+			}
+			c.drops++
+		case *schema.ModifyTable, *schema.ModifyView, *schema.ModifySchema, *schema.RenameTable, *schema.RenameView:
+			switch v := ch.(type) {
+			case *schema.ModifyView:
+				if v.To != nil && v.To.Materialized() {
+					c.recreates++
+					continue
+				}
+			case *schema.ModifyTable:
+				if hasClickhouseEngineAttrChange(v.Changes) {
+					c.recreates++
+					continue
+				}
+			}
+			c.mods++
+		case *schema.DropSchema:
+			c.drops++
+		}
+	}
+	return c
+}
+
+func hostFromURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if h := u.Hostname(); h != "" {
+		return h
+	}
+	if u.Host != "" {
+		return u.Host
+	}
+	return raw
+}
+
+func hostPrefix(host string) string {
+	if host == "" {
+		return ""
+	}
+	return "[" + host + "] "
+}
+
+func redactedURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if u, err := cloudapi.RedactedURL(raw); err == nil {
+		return u
+	}
+	return raw
 }
 
 func applyChangesWithLogging(ctx context.Context, client *sqlclient.Client, changes []schema.Change, txMode string, logFn func(schema.Change)) error {

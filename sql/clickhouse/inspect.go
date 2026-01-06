@@ -86,6 +86,7 @@ func (i *inspect) schemas(ctx context.Context, opts *schema.InspectRealmOption) 
 		args  []any
 		query = schemasQuery
 	)
+	var filterSystem bool
 	if opts != nil {
 		switch n := len(opts.Schemas); {
 		case n == 1 && opts.Schemas[0] == "":
@@ -99,6 +100,9 @@ func (i *inspect) schemas(ctx context.Context, opts *schema.InspectRealmOption) 
 				args = append(args, s)
 			}
 		}
+		filterSystem = len(opts.Schemas) == 0
+	} else {
+		filterSystem = true
 	}
 	rows, err := i.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -111,9 +115,25 @@ func (i *inspect) schemas(ctx context.Context, opts *schema.InspectRealmOption) 
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
+		if filterSystem && isSystemSchema(name) {
+			continue
+		}
 		schemas = append(schemas, &schema.Schema{Name: name})
 	}
 	return schemas, nil
+}
+
+func isSystemSchema(name string) bool {
+	switch {
+	case strings.EqualFold(name, "system"):
+		return true
+	case strings.EqualFold(name, "information_schema"):
+		return true
+	case strings.EqualFold(name, "INFORMATION_SCHEMA"):
+		return true
+	default:
+		return false
+	}
 }
 
 func (i *inspect) tables(ctx context.Context, realm *schema.Realm, opts *schema.InspectOptions) error {
@@ -337,6 +357,9 @@ func (i *inspect) indexes(ctx context.Context, realm *schema.Realm, opts *schema
 		args      []any
 		withTable bool
 	)
+	if opts == nil {
+		opts = &schema.InspectOptions{}
+	}
 	for _, s := range realm.Schemas {
 		args = append(args, s.Name)
 	}

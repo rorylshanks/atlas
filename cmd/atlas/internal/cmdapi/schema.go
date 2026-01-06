@@ -51,6 +51,7 @@ type schemaApplyFlags struct {
 	edit        bool          // Open the generated SQL in an editor.
 	autoApprove bool          // Don't prompt for approval before applying SQL.
 	logFormat   string        // Log format.
+	verbose     bool          // Print full SQL.
 	txMode      string        // (none, file)
 	lockTimeout time.Duration // Lock timeout.
 }
@@ -122,6 +123,7 @@ migration.`,
 	addFlagAutoApprove(cmd.Flags(), &flags.autoApprove)
 	addFlagLog(cmd.Flags(), &flags.logFormat)
 	addFlagFormat(cmd.Flags(), &flags.logFormat)
+	cmd.Flags().BoolVarP(&flags.verbose, "verbose", "v", false, "show full SQL in the plan output")
 	cmd.Flags().StringVarP(&flags.txMode, flagTxMode, "", txModeFile, "set transaction mode [none, file]")
 	cmd.Flags().StringVarP(&flags.planURL, flagPlan, "", "", "URL to a pre-planned migration (e.g., atlas://repo/plans/name)")
 	cmd.Flags().BoolVarP(&flags.edit, flagEdit, "", false, "open the generated SQL in an editor")

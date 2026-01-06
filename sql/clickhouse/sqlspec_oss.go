@@ -45,6 +45,15 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 		); err != nil {
 			return fmt.Errorf("clickhouse: failed converting to *schema.Realm: %w", err)
 		}
+		for _, spec := range d.Schemas {
+			s, ok := v.Schema(spec.Name)
+			if !ok {
+				return fmt.Errorf("clickhouse: could not find schema: %q", spec.Name)
+			}
+			if err := convertSchemaAttrs(spec, &s.Attrs); err != nil {
+				return err
+			}
+		}
 	case *schema.Schema:
 		var d specutil.Doc
 		if err := c.State.EvalOptions(p, &d, opts); err != nil {
@@ -58,6 +67,9 @@ func (c *Codec) EvalOptions(p *hclparse.Parser, v any, opts *schemahcl.EvalOptio
 			&specutil.ScanDoc{Schemas: d.Schemas, Tables: d.Tables, Views: d.Views, Materialized: d.Materialized},
 			scanFuncs,
 		); err != nil {
+			return err
+		}
+		if err := convertSchemaAttrs(d.Schemas[0], &r.Schemas[0].Attrs); err != nil {
 			return err
 		}
 		*v = *r.Schemas[0]
@@ -131,10 +143,28 @@ var TypeRegistry = schemahcl.NewRegistry(
 
 // schemaSpec converts from a concrete ClickHouse schema to Atlas specification.
 func schemaSpec(s *schema.Schema) (*specutil.SchemaSpec, error) {
-	return specutil.FromSchema(s, &specutil.SchemaFuncs{
+	spec, err := specutil.FromSchema(s, &specutil.SchemaFuncs{
 		Table: tableSpec,
 		View:  viewSpec,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if v := (&MaxTableSizeToDrop{}); sqlx.Has(s.Attrs, v) {
+		spec.Schema.Extra.Attrs = append(spec.Schema.Extra.Attrs, schemahcl.IntAttr("max_table_size_to_drop", v.V))
+	}
+	return spec, nil
+}
+
+func convertSchemaAttrs(spec *sqlspec.Schema, attrs *[]schema.Attr) error {
+	if attr, ok := spec.Attr("max_table_size_to_drop"); ok {
+		v, err := attr.Int64()
+		if err != nil {
+			return err
+		}
+		*attrs = append(*attrs, &MaxTableSizeToDrop{V: int(v)})
+	}
+	return nil
 }
 
 // convertTable converts a sqlspec.Table to a schema.Table.
@@ -149,6 +179,7 @@ func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, er
 		orderBy  string
 		ttl      string
 		settings string
+		limits   []string
 	)
 	if attr, ok := spec.Attr("engine"); ok {
 		v, err := attr.String()
@@ -184,6 +215,14 @@ func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, er
 			return nil, err
 		}
 		settings = v
+	}
+	if attr, ok := spec.Attr("node_limits"); ok {
+		v, err := nodeLimitsAttr(attr)
+		if err != nil {
+			return nil, err
+		}
+		limits = v
+		t.AddAttrs(&NodeLimits{V: limits})
 	}
 	if engine != "" && partBy == "" && orderBy == "" && ttl == "" && settings == "" {
 		engine, partBy, orderBy, ttl, settings = splitEngineFull(engine)
@@ -227,6 +266,7 @@ func convertView(spec *sqlspec.View, parent *schema.Schema) (*schema.View, error
 		ttl      string
 		settings string
 		to       string
+		limits   []string
 	)
 	if attr, ok := spec.Attr("engine"); ok {
 		v1, err := attr.String()
@@ -269,6 +309,14 @@ func convertView(spec *sqlspec.View, parent *schema.Schema) (*schema.View, error
 			return nil, err
 		}
 		to = v1
+	}
+	if attr, ok := spec.Attr("node_limits"); ok {
+		v1, err := nodeLimitsAttr(attr)
+		if err != nil {
+			return nil, err
+		}
+		limits = v1
+		v.AddAttrs(&NodeLimits{V: limits})
 	}
 	if engine != "" && partBy == "" && orderBy == "" && ttl == "" && settings == "" {
 		engine, partBy, orderBy, ttl, settings = splitEngineFull(engine)
@@ -346,6 +394,24 @@ func convertColumnType(spec *sqlspec.Column) (schema.Type, error) {
 	return TypeRegistry.Type(spec.Type, spec.Extra.Attrs)
 }
 
+func nodeLimitsAttr(attr *schemahcl.Attr) ([]string, error) {
+	switch attr.V.Type() {
+	case cty.String:
+		v, err := attr.String()
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(v) == "" {
+			return []string{}, nil
+		}
+		return []string{v}, nil
+	case cty.List(cty.String):
+		return attr.Strings()
+	default:
+		return nil, fmt.Errorf("node_limits must be a string or list of strings, got %s", attr.V.Type().FriendlyName())
+	}
+}
+
 func clickhouseGenType(s string) string {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "ALIAS":
@@ -387,6 +453,9 @@ func tableSpec(t *schema.Table) (*sqlspec.Table, error) {
 	if s := (&EngineSettings{}); sqlx.Has(t.Attrs, s) && s.V != "" {
 		spec.DefaultExtension.Extra.SetAttr(schemahcl.StringAttr("settings", s.V))
 	}
+	if l := (&NodeLimits{}); sqlx.Has(t.Attrs, l) {
+		spec.DefaultExtension.Extra.SetAttr(schemahcl.StringsAttr("node_limits", l.V...))
+	}
 	return spec, nil
 }
 
@@ -413,6 +482,9 @@ func viewSpec(v *schema.View) (*sqlspec.View, error) {
 	}
 	if t := (&MaterializedViewTo{}); sqlx.Has(v.Attrs, t) && t.V != "" {
 		spec.DefaultExtension.Extra.SetAttr(schemahcl.StringAttr("to", t.V))
+	}
+	if l := (&NodeLimits{}); sqlx.Has(v.Attrs, l) {
+		spec.DefaultExtension.Extra.SetAttr(schemahcl.StringsAttr("node_limits", l.V...))
 	}
 	return spec, nil
 }

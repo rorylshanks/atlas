@@ -420,6 +420,11 @@ func (s *State) EvalOptions(parsed *hclparse.Parser, v any, opts *EvalOptions) e
 			}
 		}
 	}
+	for _, name := range fileNames {
+		if err := s.expandForEach(ctx, files[name].Body.(*hclsyntax.Body)); err != nil {
+			return err
+		}
+	}
 	spec := &Resource{}
 	sort.Slice(fileNames, func(i, j int) bool {
 		return fileNames[i] < fileNames[j]
@@ -553,6 +558,9 @@ func (s *State) resource(ctx *hcl.EvalContext, opts *EvalOptions, file *hcl.File
 		resource, err := s.toResource(ctx, opts, blk, []string{blk.Type}, dec.children[blk.Type])
 		if err != nil {
 			return nil, err
+		}
+		if resource == nil {
+			continue
 		}
 		res.Children = append(res.Children, resource)
 	}
@@ -765,6 +773,13 @@ func (s *State) toResource(ctx *hcl.EvalContext, opts *EvalOptions, block *hclsy
 	if err != nil {
 		return nil, err
 	}
+	attrs, keep, err := applyNodesFilter(ctx, block, attrs)
+	if err != nil {
+		return nil, err
+	}
+	if !keep {
+		return nil, nil
+	}
 	spec.Attrs = attrs
 	for _, blk := range block.Body.Blocks {
 		cdec := dec.child(blk.Type)
@@ -776,7 +791,9 @@ func (s *State) toResource(ctx *hcl.EvalContext, opts *EvalOptions, block *hclsy
 		if err != nil {
 			return nil, err
 		}
-		spec.Children = append(spec.Children, r)
+		if r != nil {
+			spec.Children = append(spec.Children, r)
+		}
 	}
 	if err := closeScope(); err != nil {
 		return nil, err
@@ -1106,6 +1123,30 @@ func (s *State) forEachBlocks(ctx *hcl.EvalContext, b *hclsyntax.Block) ([]*hcls
 		blocks = append(blocks, nb)
 	}
 	return blocks, nil
+}
+
+func (s *State) expandForEach(ctx *hcl.EvalContext, body *hclsyntax.Body) error {
+	if body == nil {
+		return nil
+	}
+	blocks := make(hclsyntax.Blocks, 0, len(body.Blocks))
+	for _, b := range body.Blocks {
+		switch {
+		case b.Body != nil && b.Body.Attributes[forEachAttr] != nil:
+			nb, err := s.forEachBlocks(ctx, b)
+			if err != nil {
+				return err
+			}
+			blocks = append(blocks, nb...)
+		default:
+			if err := s.expandForEach(ctx, b.Body); err != nil {
+				return err
+			}
+			blocks = append(blocks, b)
+		}
+	}
+	body.Blocks = blocks
+	return nil
 }
 
 func (s *State) copyBlock(ctx *hcl.EvalContext, b *hclsyntax.Block, scope []string) (*hclsyntax.Block, error) {

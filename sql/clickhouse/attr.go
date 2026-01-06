@@ -30,10 +30,22 @@ type EngineSettings struct {
 	V string
 }
 
+// MaxTableSizeToDrop configures the ClickHouse max_table_size_to_drop setting.
+type MaxTableSizeToDrop struct {
+	schema.Attr
+	V int
+}
+
 // EnginePartitionBy describes the PARTITION BY clause for the table engine.
 type EnginePartitionBy struct {
 	schema.Attr
 	V string
+}
+
+// NodeLimits describes the nodes allowed to create/apply the table or view.
+type NodeLimits struct {
+	schema.Attr
+	V []string
 }
 
 // MaterializedViewTo describes the target table for a materialized view.
@@ -58,4 +70,13 @@ type IndexType struct {
 type IndexGranularity struct {
 	schema.Attr
 	V int
+}
+
+func isEngineAttr(attr schema.Attr) bool {
+	switch attr.(type) {
+	case *Engine, *EnginePartitionBy, *EngineOrderBy, *EngineTTL:
+		return true
+	default:
+		return false
+	}
 }
