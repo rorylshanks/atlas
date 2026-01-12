@@ -1441,8 +1441,11 @@ func commonSuffixLen(a, b string) int {
 }
 
 func trimDiff(a, b string, prefix, suffix, keep int) (string, string) {
-	aMid := a[prefix : len(a)-suffix]
-	bMid := b[prefix : len(b)-suffix]
+	// Clamp prefix/suffix to avoid overlapping slices on identical strings.
+	maxPrefix := min(prefix, min(len(a), len(b)))
+	maxSuffix := min(suffix, min(len(a)-maxPrefix, len(b)-maxPrefix))
+	aMid := a[maxPrefix : len(a)-maxSuffix]
+	bMid := b[maxPrefix : len(b)-maxSuffix]
 	return shortenMid(aMid, keep), shortenMid(bMid, keep)
 }
 
